@@ -1,0 +1,379 @@
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { geminiConfig, SAFE_AI_MESSAGE } = require('../../config/gemini');
+const {
+  FALLBACK_SYSTEM_PROMPT,
+  UPLOADED_MATERIAL_CHAT_PROMPT,
+  RAG_SYSTEM_PROMPT,
+  buildRagUserPrompt,
+} = require('../../constants/prompts');
+const keyManager = require('./keyManager');
+
+const ALL_KEYS_BUSY_MESSAGE =
+  'AI sedang sibuk karena seluruh kuota API sedang habis. Silakan coba lagi beberapa saat.';
+
+class GeminiError extends Error {
+  constructor(internalMessage, statusCode = 502, publicMessage = SAFE_AI_MESSAGE) {
+    super(internalMessage);
+    this.name = 'GeminiError';
+    this.statusCode = statusCode;
+    this.publicMessage = publicMessage;
+  }
+}
+
+const logGeminiError = (err, keyId, context = 'generateContent') => {
+  console.error(`[Gemini] ${context} (Key #${keyId}) — error asli:`);
+  console.error(`  message : ${err.message}`);
+  if (err.status != null) console.error(`  status  : ${err.status}`);
+  if (err.statusText) console.error(`  statusText: ${err.statusText}`);
+  if (err.errorDetails) console.error('  details :', JSON.stringify(err.errorDetails, null, 2));
+};
+
+const isQuotaExceededError = (err) => {
+  const message = err.message?.toLowerCase() || '';
+  const details = JSON.stringify(err.errorDetails || {}).toLowerCase();
+
+  return (
+    err.status === 429
+    || message.includes('resource_exhausted')
+    || message.includes('quota exceeded')
+    || message.includes('quota')
+    || message.includes('rate limit')
+    || details.includes('resource_exhausted')
+    || details.includes('quota exceeded')
+  );
+};
+
+const createGenerativeModel = (apiKey, systemInstruction) => {
+  const genAI = new GoogleGenerativeAI(apiKey);
+  return genAI.getGenerativeModel({
+    model: geminiConfig.model,
+    systemInstruction,
+  });
+};
+
+const formatHistoryForGemini = (conversationHistory) => {
+  return conversationHistory.map((msg) => ({
+    role: msg.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: msg.content }],
+  }));
+};
+
+const callGeminiWithKey = async (keyEntry, systemInstruction, contents) => {
+  const model = createGenerativeModel(keyEntry.key, systemInstruction);
+
+  // Batas iterasi continuation sebagai safety guard agar tidak infinite loop
+  const MAX_CONTINUATION = 3;
+
+  let fullText = '';
+  let currentContents = contents;
+
+  for (let iteration = 0; iteration <= MAX_CONTINUATION; iteration += 1) {
+    const result = await model.generateContent({
+      contents: currentContents,
+      generationConfig: {
+        maxOutputTokens: geminiConfig.maxOutputTokens,
+      },
+    });
+
+    const candidate = result.response.candidates?.[0];
+    const finishReason = candidate?.finishReason ?? 'UNKNOWN';
+    const partText = result.response.text() ?? '';
+
+    // Jika bagian ini kosong dan kita belum punya teks apapun, lempar error
+    if (!partText && !fullText) {
+      throw new GeminiError('Gemini mengembalikan respons kosong', 502);
+    }
+
+    // Gabungkan teks bagian ini ke hasil keseluruhan
+    fullText += partText;
+
+    console.log(
+      `[Gemini] Iterasi ${iteration + 1}: finishReason=${finishReason}, panjang teks=${partText.length} karakter`
+    );
+
+    // Selesai secara normal → langsung keluar loop
+    if (finishReason === 'STOP' || finishReason === 'END_OF_TURN') {
+      break;
+    }
+
+    // Respons terpotong karena batas token → minta Gemini melanjutkan
+    if (finishReason === 'MAX_TOKENS') {
+      if (iteration < MAX_CONTINUATION) {
+        console.warn(
+          `[Gemini] Respons terpotong (MAX_TOKENS) pada iterasi ${iteration + 1}. Meminta lanjutan...`
+        );
+
+        // Tambahkan teks yang sudah ada sebagai giliran model,
+        // lalu tambahkan perintah user untuk melanjutkan
+        currentContents = [
+          ...currentContents,
+          { role: 'model', parts: [{ text: partText }] },
+          { role: 'user', parts: [{ text: 'Lanjutkan.' }] },
+        ];
+        continue;
+      } else {
+        console.warn(
+          `[Gemini] Batas iterasi continuation tercapai (${MAX_CONTINUATION}). Menggunakan teks yang sudah ada.`
+        );
+        break;
+      }
+    }
+
+    // finishReason lain (SAFETY, RECITATION, dll.) → berhenti dengan teks yang sudah terkumpul
+    console.warn(`[Gemini] Berhenti dengan finishReason=${finishReason}.`);
+    break;
+  }
+
+  if (!fullText.trim()) {
+    throw new GeminiError('Gemini mengembalikan respons kosong setelah continuation', 502);
+  }
+
+  return fullText.trim();
+};
+
+const executeGenerateContent = async (systemInstruction, contents) => {
+  if (!keyManager.hasKeys()) {
+    throw new GeminiError(
+      'Tidak ada GEMINI_API_KEY yang dikonfigurasi',
+      503,
+      ALL_KEYS_BUSY_MESSAGE
+    );
+  }
+
+  const triedKeyIds = new Set();
+  const maxAttempts = keyManager.getTotalKeys();
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const keyEntry = keyManager.getCurrentKey();
+
+    if (!keyEntry || triedKeyIds.has(keyEntry.id)) {
+      break;
+    }
+
+    triedKeyIds.add(keyEntry.id);
+
+    try {
+      console.log(
+        `[Gemini] Menggunakan Key #${keyEntry.id} (${geminiConfig.model})`
+      );
+
+      const response = await callGeminiWithKey(
+        keyEntry,
+        systemInstruction,
+        contents
+      );
+
+      console.log(`[Gemini] Key #${keyEntry.id} berhasil.`);
+      return response;
+    } catch (err) {
+      logGeminiError(err, keyEntry.id);
+
+      const errorMessage = err.message?.toLowerCase() || '';
+
+      // ===== QUOTA HABIS =====
+      if (isQuotaExceededError(err)) {
+        console.warn(
+          `[Gemini] Key #${keyEntry.id} quota habis. Pindah ke key berikutnya...`
+        );
+
+        keyManager.markUnavailable(keyEntry.id);
+        continue;
+      }
+
+      // ===== API KEY / PROJECT BERMASALAH =====
+      if (
+        err.status === 401 ||
+        err.status === 403 ||
+        errorMessage.includes('api key') ||
+        errorMessage.includes('api_key') ||
+        errorMessage.includes('invalid api key') ||
+        errorMessage.includes('permission denied') ||
+        errorMessage.includes('forbidden') ||
+        errorMessage.includes('denied access')
+      ) {
+        console.warn(
+          `[Gemini] Key #${keyEntry.id} tidak valid / tidak memiliki akses. Skip ke key berikutnya...`
+        );
+
+        keyManager.markUnavailable(keyEntry.id);
+        continue;
+      }
+
+      // ===== SERVER GEMINI SEDANG BERMASALAH =====
+      if (
+        err.status === 500 ||
+        err.status === 502 ||
+        err.status === 503 ||
+        err.status === 504 ||
+        errorMessage.includes('overloaded') ||
+        errorMessage.includes('timeout') ||
+        errorMessage.includes('internal')
+      ) {
+        console.warn(
+          `[Gemini] Gemini sedang sibuk. Coba key berikutnya...`
+        );
+
+        keyManager.markUnavailable(keyEntry.id);
+        continue;
+      }
+
+      // ===== MODEL SALAH =====
+      if (
+        err.status === 404 ||
+        errorMessage.includes('not found')
+      ) {
+        throw new GeminiError(
+          `Model "${geminiConfig.model}" tidak ditemukan: ${err.message}`,
+          502
+        );
+      }
+
+      // ===== ERROR LAIN =====
+      console.warn(
+        `[Gemini] Error tidak dikenal pada Key #${keyEntry.id}. Mencoba key berikutnya...`
+      );
+
+      keyManager.markUnavailable(keyEntry.id);
+      continue;
+    }
+  }
+
+  throw new GeminiError(
+    'Semua Gemini API Key sedang unavailable',
+    503,
+    ALL_KEYS_BUSY_MESSAGE
+  );
+};
+
+// const executeGenerateContent = async (systemInstruction, contents) => {
+//   if (!keyManager.hasKeys()) {
+//     throw new GeminiError(
+//       'Tidak ada GEMINI_API_KEY yang dikonfigurasi',
+//       503,
+//       ALL_KEYS_BUSY_MESSAGE
+//     );
+//   }
+
+//   const triedKeyIds = new Set();
+//   const maxAttempts = keyManager.getTotalKeys();
+
+//   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+//     const keyEntry = keyManager.getCurrentKey();
+
+//     if (!keyEntry || triedKeyIds.has(keyEntry.id)) {
+//       break;
+//     }
+
+//     triedKeyIds.add(keyEntry.id);
+
+//     try {
+//       console.log(`[Gemini] Memanggil model: ${geminiConfig.model}`);
+//       return await callGeminiWithKey(keyEntry, systemInstruction, contents);
+//     } catch (err) {
+//       if (err instanceof GeminiError && !isQuotaExceededError(err)) {
+//         throw err;
+//       }
+
+//       if (isQuotaExceededError(err)) {
+//         logGeminiError(err, keyEntry.id);
+//         keyManager.markUnavailable(keyEntry.id);
+//         continue;
+//       }
+
+//       logGeminiError(err, keyEntry.id);
+
+//       const errorMessage = err.message?.toLowerCase() || '';
+
+//       if (errorMessage.includes('api key') || errorMessage.includes('api_key')) {
+//         keyManager.markUnavailable(keyEntry.id);
+//         continue;
+//       }
+
+//       if (err.status === 404 || errorMessage.includes('not found')) {
+//         throw new GeminiError(
+//           `Model "${geminiConfig.model}" tidak ditemukan: ${err.message}`,
+//           502
+//         );
+//       }
+
+//       if (err.status === 503 || errorMessage.includes('overloaded')) {
+//         throw new GeminiError(`Gemini overloaded: ${err.message}`, 503);
+//       }
+
+//       throw new GeminiError(`Gemini gagal: ${err.message}`, 502);
+//     }
+//   }
+
+//   throw new GeminiError(
+//     'Semua Gemini API key sedang unavailable',
+//     503,
+//     ALL_KEYS_BUSY_MESSAGE
+//   );
+// };
+
+const injectRpsContext = (rpsText, contents) => {
+  if (rpsText) {
+    contents.unshift({
+      role: 'user',
+      parts: [{ text: `[ISI RPS MATA KULIAH]\n\n${rpsText}\n\n[SELESAI ISI RPS]` }],
+    });
+    // Add a dummy model acknowledgement to keep the conversation alternating properly
+    contents.splice(1, 0, {
+      role: 'model',
+      parts: [{ text: `Baik, saya telah membaca RPS mata kuliah tersebut dan akan menggunakannya sebagai acuan utama.` }],
+    });
+  }
+  return contents;
+};
+
+const generateFallbackResponse = async (conversationHistory, rpsText) => {
+  if (!conversationHistory || conversationHistory.length === 0) {
+    throw new GeminiError('Riwayat percakapan tidak boleh kosong', 400);
+  }
+
+  let contents = formatHistoryForGemini(conversationHistory);
+  contents = injectRpsContext(rpsText, contents);
+  
+  return executeGenerateContent(FALLBACK_SYSTEM_PROMPT, contents);
+};
+
+const generateUploadedMaterialChatResponse = async (conversationHistory, rpsText) => {
+  if (!conversationHistory || conversationHistory.length === 0) {
+    throw new GeminiError('Riwayat percakapan tidak boleh kosong', 400);
+  }
+
+  let contents = formatHistoryForGemini(conversationHistory);
+  contents = injectRpsContext(rpsText, contents);
+
+  return executeGenerateContent(UPLOADED_MATERIAL_CHAT_PROMPT, contents);
+};
+
+const generateRagResponse = async ({ question, chunks, conversationHistory = [], rpsText }) => {
+  if (!question?.trim()) {
+    throw new GeminiError('Pertanyaan tidak boleh kosong', 400);
+  }
+
+  if (!chunks || chunks.length === 0) {
+    throw new GeminiError('Chunk materi tidak boleh kosong untuk mode RAG', 400);
+  }
+
+  const priorHistory = conversationHistory.slice(0, -1);
+  const ragPrompt = buildRagUserPrompt(question, chunks);
+
+  let contents = [
+    ...formatHistoryForGemini(priorHistory),
+    { role: 'user', parts: [{ text: ragPrompt }] },
+  ];
+
+  contents = injectRpsContext(rpsText, contents);
+
+  return executeGenerateContent(RAG_SYSTEM_PROMPT, contents);
+};
+
+module.exports = {
+  generateFallbackResponse,
+  generateUploadedMaterialChatResponse,
+  generateRagResponse,
+  GeminiError,
+  executeGenerateContent,
+};
